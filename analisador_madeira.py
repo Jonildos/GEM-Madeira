@@ -1,346 +1,335 @@
-import argparse
 import io
-import json
 import os
-import shutil
-import sys
 import time
-import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from PIL import Image, ImageOps
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-# --- 1. Caminhos Seguros e Configuração de Ambiente ---
+# Carrega .env apenas se existir (desenvolvimento local).
+# Em produção (Azure App Service), as variáveis vêm do ambiente do sistema.
+load_dotenv(override=False)
 
-BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR / ".env"
-PASTA_PROCESSADAS = BASE_DIR / "inspecoes_processadas"
-EXTENSOES_ACEITAS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+MAX_IMAGENS_POR_INSPECAO = 5
+MODELOS_PADRAO = [
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+]
 
 
-# --- 2. Contratos de Dados (Pydantic Schemas) ---
+# --- 1. Contratos de Dados (camelCase para o contrato do jade-backend) ---
+def _to_camel(string: str) -> str:
+    partes = string.split("_")
+    return partes[0] + "".join(p.capitalize() for p in partes[1:])
 
-class EstatisticasFendas(BaseModel):
-    quantidade: int = Field(
-        ge=0,
-        description="Número total de fendas ou rachaduras visíveis.",
+
+class BaseCamelModel(BaseModel):
+    model_config = ConfigDict(
+        alias_generator=_to_camel,
+        populate_by_name=True,
     )
-    severidade_maxima: Literal[
-        "nenhuma",
-        "superficial_fina",
-        "moderada",
-        "estrutural_passante",
-    ]
+
+
+class DeteccaoDefeito(BaseCamelModel):
+    """Representa um achado individual compatível com app/business_rules.py."""
+
+    tipo_defeito: Literal[
+        "fenda_rachadura",
+        "no_firme",
+        "no_solto_cariado",
+        "empenamento",
+        "apodrecimento",
+        "outro",
+    ] = Field(description="Categoria do defeito físico encontrado no dormente.")
+    severidade: Literal["leve", "moderada", "critica"] = Field(
+        description="Severidade para aplicação das regras de veredito."
+    )
+    confianca: float = Field(
+        ge=0.0,
+        le=1.0,
+        description="Confiança estimada da detecção (0.0 a 1.0).",
+    )
     localizacao: Literal[
-        "nenhuma",
         "topo_extremidade",
         "centro_face",
         "bordas",
         "multiplas_regioes",
+        "indeterminado",
     ]
-    extensao_relativa_percentual: float = Field(
+    comprimento_pixels: Optional[float] = Field(None, ge=0)
+    largura_pixels: Optional[float] = Field(None, ge=0)
+    comprimento_cm: Optional[float] = Field(
+        None,
         ge=0,
-        le=100,
-        description="Percentual do comprimento da peça afetado pela maior fenda (0 a 100).",
+        description="Estimativa em cm (calculada automaticamente se houver régua de 30 cm).",
+    )
+    largura_cm: Optional[float] = Field(
+        None,
+        ge=0,
+        description="Estimativa em cm (calculada automaticamente se houver régua de 30 cm).",
+    )
+    observacao: str = Field(description="Descrição técnica curta do defeito.")
+
+
+class CalibracaoEscala(BaseCamelModel):
+    regua_30cm_detectada: bool = Field(
+        description="True se houver régua de 30 cm visível; False caso contrário."
+    )
+    comprimento_regua_pixels: Optional[float] = Field(
+        None,
+        gt=0,
+        description="Comprimento ocupado pelos 30 cm da régua em pixels.",
+    )
+    fator_conversao_px_para_cm: Optional[float] = Field(
+        None,
+        description="Calculado automaticamente (30.0 / comprimento_regua_pixels).",
+    )
+    comprimento_peca_pixels: Optional[float] = Field(None, ge=0)
+    largura_peca_pixels: Optional[float] = Field(None, ge=0)
+    comprimento_peca_cm: Optional[float] = Field(None, ge=0)
+    largura_peca_cm: Optional[float] = Field(None, ge=0)
+    observacao_escala: str = Field(
+        description="Nota curta sobre a referência de escala utilizada."
     )
 
 
-class EstatisticasNos(BaseModel):
-    nos_firmes: int = Field(
-        ge=0,
-        description="Nós sadios, claros e integrados à fibra da madeira.",
+class ResultadoAnaliseIA(BaseCamelModel):
+    dormente_detectado: bool = Field(
+        description="True se houver dormente/peça de madeira visível. False evita falso APROVADO (Bug #204)."
     )
-    nos_soltos_ou_cariados: int = Field(
-        ge=0,
-        description="Nós escuros, soltos, rachados, podres ou com perda de material.",
+    qualidade_imagem_suficiente: bool = Field(
+        description="False apenas se a imagem estiver muito escura, tremida ou obstruída."
     )
-    quantidade_total: int = Field(
-        ge=0,
-        description="Soma exata de nos_firmes + nos_soltos_ou_cariados.",
-    )
-    area_ocupada_estimada_percentual: float = Field(
-        ge=0,
-        le=100,
-        description="Percentual aproximado da área visível da face ocupada por nós (0 a 100).",
+    calibracao: CalibracaoEscala
+    deteccoes: list[DeteccaoDefeito] = Field(default_factory=list)
+    veredito_sugerido: Literal[
+        "aprovado",
+        "quarentena",
+        "rejeitado",
+        "analise_necessaria",
+    ] = Field(description="Calculado automaticamente via regra de negócio.")
+    parecer_tecnico: str = Field(
+        description="Parecer técnico objetivo em até 3 frases, sem saudações."
     )
 
     @model_validator(mode="after")
-    def corrigir_soma_nos(self) -> "EstatisticasNos":
-        self.quantidade_total = self.nos_firmes + self.nos_soltos_ou_cariados
+    def processar_escala_e_veredito(self) -> "ResultadoAnaliseIA":
+        # 1. Conversão de escala (pixels -> cm) com arredondamento realista (1 casa decimal)
+        esc = self.calibracao
+        if (
+            esc.regua_30cm_detectada
+            and esc.comprimento_regua_pixels is not None
+            and esc.comprimento_regua_pixels > 0
+        ):
+            fator = 30.0 / esc.comprimento_regua_pixels
+            esc.fator_conversao_px_para_cm = round(fator, 5)
+
+            if esc.comprimento_peca_pixels is not None:
+                esc.comprimento_peca_cm = round(esc.comprimento_peca_pixels * fator, 1)
+            if esc.largura_peca_pixels is not None:
+                esc.largura_peca_cm = round(esc.largura_peca_pixels * fator, 1)
+
+            for det in self.deteccoes:
+                if det.comprimento_pixels is not None:
+                    det.comprimento_cm = round(det.comprimento_pixels * fator, 1)
+                if det.largura_pixels is not None:
+                    det.largura_cm = round(det.largura_pixels * fator, 1)
+        else:
+            esc.regua_30cm_detectada = False
+            esc.comprimento_regua_pixels = None
+            esc.fator_conversao_px_para_cm = None
+            esc.comprimento_peca_cm = None
+            esc.largura_peca_cm = None
+            for det in self.deteccoes:
+                det.comprimento_cm = None
+                det.largura_cm = None
+
+        # 2. Espelho das regras de negócio (app/business_rules.py + Bug #204)
+        if not self.dormente_detectado or not self.qualidade_imagem_suficiente:
+            self.veredito_sugerido = "analise_necessaria"
+            return self
+
+        criticas = [
+            d for d in self.deteccoes if d.severidade == "critica" and d.confianca >= 0.40
+        ]
+        moderadas = [
+            d for d in self.deteccoes if d.severidade == "moderada" and d.confianca >= 0.40
+        ]
+        leves = [
+            d for d in self.deteccoes if d.severidade == "leve" and d.confianca >= 0.40
+        ]
+
+        if criticas:
+            self.veredito_sugerido = "rejeitado"
+        elif moderadas or len(leves) >= 3:
+            self.veredito_sugerido = "quarentena"
+        else:
+            self.veredito_sugerido = "aprovado"
+
         return self
 
 
-class AnaliseEmpenamento(BaseModel):
-    status: Literal[
-        "nao_detectado",
-        "leve",
-        "moderado",
-        "severo",
-        "inconclusivo_angulo_foto",
-    ]
-    tipo_predominante: Literal[
-        "nenhum",
-        "encurvamento_lateral",
-        "arqueamento_longitudinal",
-        "encanoamento_transversal",
-        "torcao",
-        "indeterminado_sem_vista_topo",
-    ]
-    observacao_geometria: str = Field(
-        description="Descrição técnica curta da deformação ou aviso sobre o ângulo da foto.",
-    )
-
-
-class LaudoTecnicoMadeira(BaseModel):
-    qualidade_imagem_suficiente: bool = Field(
-        description="True se a foto permite inspecionar a madeira; False se inadequada.",
-    )
-    fendas: EstatisticasFendas
-    nos: EstatisticasNos
-    empenamento: AnaliseEmpenamento
-    parecer_tecnico_inicial: str = Field(
-        description="Parecer técnico direto e objetivo em até 3 frases, sem saudações.",
-    )
-    conformidade: Literal[
-        "CONFORME",
-        "CONFORME_COM_RESSALVAS",
-        "NAO_CONFORME",
-        "INCONCLUSIVO_FOTO_INADEQUADA",
-    ]
-
-
-class RespostaBackend(BaseModel):
+class RespostaMotorIA(BaseCamelModel):
     sucesso: bool
     timestamp_iso: str
-    arquivos_originais: list[str]
-    arquivos_renomeados: list[str]
+    resolucao_enviada_pixels: list[str]
     modelo_utilizado: Optional[str] = None
     tempo_processamento_segundos: float
-    laudo: Optional[LaudoTecnicoMadeira] = None
+    analise: Optional[ResultadoAnaliseIA] = None
     erro: Optional[str] = None
 
 
-# --- 3. Regras de Negócio e Segurança ---
-
+# --- 2. Prompt Técnico ---
 SYSTEM_PROMPT = """
-Você é um inspetor técnico sênior de qualidade de madeira serrada e beneficiada.
-Analise as imagens fornecidas buscando exclusivamente não conformidades físicas: fendas/rachaduras, nós (firmes vs. soltos/mortos) e empenamento.
+Você é um inspetor técnico sênior de qualidade de dormentes de madeira serrada e beneficiada.
+Analise as imagens fornecidas buscando não conformidades físicas (fendas/rachaduras, nós, apodrecimento e empenamento).
 
-Regras técnicas obrigatórias:
-1. Não confunda veios naturais escuros, variações de cerne/alburno ou marcas normais de serra com fendas.
-2. Fendas têm abertura física ou sombra de profundidade longitudinal.
-3. Empenamento (arqueamento, encanoamento, torção) exige visão de borda/topo ou referência de superfície plana. Se houver apenas uma foto frontal chapada sem curvatura lateral visível, defina status como 'inconclusivo_angulo_foto' e tipo como 'indeterminado_sem_vista_topo'.
-4. Se a imagem estiver muito tremida, escura ou não mostrar madeira claramente, marque qualidade_imagem_suficiente=False e conformidade='INCONCLUSIVO_FOTO_INADEQUADA'.
+Regras obrigatórias:
+1. Detecção do Dormente: Se não houver um dormente ou peça de madeira claramente visível na foto, defina `dormente_detectado=false` e retorne `deteccoes=[]`.
+2. Detecções Individuais: Liste cada defeito relevante encontrado em `deteccoes`, atribuindo `severidade` ('leve', 'moderada' ou 'critica') e `confianca` realista entre 0.0 e 1.0.
+3. Medição em Pixels Primeiro: Use a resolução informada (largura x altura px) como referência para estimar as dimensões em pixels.
+4. Régua de 30 cm Opcional: Se houver uma régua de 30 cm visível, defina `regua_30cm_detectada=true` e informe `comprimento_regua_pixels`. O sistema converterá automaticamente para cm. Se não houver régua, siga a inspeção normalmente.
+5. Diferenciação: Não confunda veios naturais escuros, manchas superficiais ou marcas normais de serra com rachaduras estruturais.
+6. Empenamento: Só registre empenamento se o ângulo da foto (borda/topo ou referência plana) permitir comprovar a deformação.
 """
 
 
-def obter_api_key_segura() -> str:
-    """Carrega a chave exclusivamente do arquivo .env e bloqueia execução sem chave."""
-    load_dotenv(dotenv_path=ENV_PATH, override=True)
-    chave = os.getenv("GEMINI_API_KEY", "").strip()
-
-    if not chave or chave == "COLE_SUA_API_KEY_AQUI":
-        if not ENV_PATH.exists():
-            ENV_PATH.write_text("GEMINI_API_KEY=COLE_SUA_API_KEY_AQUI\n", encoding="utf-8")
-        raise PermissionError(
-            f"GEMINI_API_KEY ausente ou inválida. Configure sua chave no arquivo: {ENV_PATH}"
-        )
-    return chave
-
-
-def localizar_imagens_para_processar(caminhos_informados: list[str]) -> list[Path]:
-    """Localiza as imagens passadas por argumento ou busca automaticamente na pasta atual."""
-    if caminhos_informados:
-        arquivos = [Path(c).resolve() for c in caminhos_informados]
-        for arq in arquivos:
-            if not arq.exists():
-                raise FileNotFoundError(f"Arquivo não encontrado: {arq}")
-        return arquivos
-
-    # Se nenhum caminho foi passado, busca automaticamente imagens na pasta do projeto
-    candidatos = [
-        p for p in BASE_DIR.iterdir()
-        if p.is_file() and p.suffix.lower() in EXTENSOES_ACEITAS
-    ]
-    if not candidatos:
-        raise FileNotFoundError(
-            f"Nenhuma imagem ({', '.join(EXTENSOES_ACEITAS)}) encontrada em {BASE_DIR}"
-        )
-
-    # Processa a imagem mais recente colocada na pasta
-    candidatos.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return [candidatos[0]]
-
-
-def renomear_e_padronizar_imagem(
-    caminho_origem: Path,
-    indice: int,
-    lote_id: str,
+# --- 3. Funções Internas (100% em memória) ---
+def _preparar_imagem_em_memoria(
+    entrada: Union[bytes, str, Path],
     max_lado: int = 1024,
-) -> tuple[Path, types.Part]:
-    """
-    Renomeia a foto para um padrão seguro (sem espaços ou caracteres especiais),
-    arquiva na pasta 'inspecoes_processadas' e retorna os bytes JPEG otimizados.
-    """
-    PASTA_PROCESSADAS.mkdir(parents=True, exist_ok=True)
+) -> tuple[types.Part, tuple[int, int]]:
+    """Corrige orientação EXIF e redimensiona a imagem em RAM sem tocar no disco."""
+    fonte = io.BytesIO(entrada) if isinstance(entrada, (bytes, bytearray)) else entrada
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    novo_nome = f"peca_{timestamp}_{lote_id}_vista{indice}.jpg"
-    destino_renomeado = PASTA_PROCESSADAS / novo_nome
-
-    with Image.open(caminho_origem) as img:
+    with Image.open(fonte) as img:
         img_corrigida = ImageOps.exif_transpose(img).convert("RGB")
-
-        # Salva a cópia renomeada em alta qualidade para auditoria do backend
-        img_corrigida.save(destino_renomeado, format="JPEG", quality=92)
-
-        # Cria versão reduzida em memória para envio rápido à API
         img_corrigida.thumbnail((max_lado, max_lado), Image.Resampling.LANCZOS)
+        dimensoes = img_corrigida.size  # (largura, altura)
+
         buffer = io.BytesIO()
         img_corrigida.save(buffer, format="JPEG", quality=85)
-        bytes_api = buffer.getvalue()
+        bytes_otimizados = buffer.getvalue()
 
-    # Remove o arquivo original solto na raiz (ou mantém se já estava na pasta processadas)
-    if caminho_origem.parent == BASE_DIR and caminho_origem != destino_renomeado:
-        try:
-            caminho_origem.unlink()
-        except OSError:
-            shutil.move(str(caminho_origem), str(destino_renomeado))
-
-    part = types.Part.from_bytes(data=bytes_api, mime_type="image/jpeg")
-    return destino_renomeado, part
+    part = types.Part.from_bytes(data=bytes_otimizados, mime_type="image/jpeg")
+    return part, dimensoes
 
 
-def listar_modelos_candidatos(client: genai.Client) -> list[str]:
-    modelo_fixo = os.getenv("GEMINI_MODEL", "").strip()
-    if modelo_fixo:
-        return [modelo_fixo]
-
-    ignorados = (
-        "tts", "image", "embedding", "veo", "imagen",
-        "audio", "robotics", "thinking", "gemma", "aqa",
-    )
-    disponiveis = []
-    try:
-        for m in client.models.list():
-            nome = m.name.replace("models/", "")
-            if nome.startswith("gemini-") and not any(t in nome for t in ignorados):
-                disponiveis.append(nome)
-    except Exception:
-        pass
-
-    preferidos = [
-        "gemini-3.8-flash-lite",
-        "gemini-3.8-flash",
-        "gemini-3.8-pro",
-        "gemini-3.0-flash",
-        "gemini-2.5-flash-lite",
-        "gemini-2.5-pro",
-    ]
-    fila = [m for m in preferidos if m in disponiveis] + [
-        m for m in disponiveis if m not in preferidos
-    ]
-    return fila if fila else preferidos
+def _obter_modelos(modelo_forcado: Optional[str]) -> list[str]:
+    if modelo_forcado:
+        return [modelo_forcado]
+    env_model = os.getenv("GEMINI_MODEL", "").strip()
+    if env_model:
+        return [env_model]
+    return MODELOS_PADRAO
 
 
-def executar_inspecao(caminhos_entrada: list[str]) -> RespostaBackend:
+# --- 4. Interface Pública para o Backend ---
+def analisar_madeira(
+    imagens: list[Union[bytes, str, Path]],
+    api_key: Optional[str] = None,
+    modelo: Optional[str] = None,
+    timeout_ms: int = 25000,
+    retornar_dict: bool = True,
+) -> Union[dict, RespostaMotorIA]:
+    """
+    Executa a análise visual de até 5 imagens de dormentes de madeira.
+
+    Args:
+        imagens: Lista de imagens em bytes (ex: UploadFile.read()) ou caminhos de arquivo.
+        api_key: Chave da API Gemini. Se omitida, lê de GEMINI_API_KEY no ambiente.
+        modelo: Nome fixo do modelo Gemini. Se omitido, usa GEMINI_MODEL ou lista padrão.
+        timeout_ms: Timeout da requisição HTTP para a API Gemini em milissegundos.
+        retornar_dict: Se True, retorna dict já serializado em camelCase. Se False, retorna RespostaMotorIA.
+    """
     inicio = time.time()
-    lote_id = uuid.uuid4().hex[:6]
-    originais_str: list[str] = []
-    renomeados_str: list[str] = []
+    resolucoes: list[str] = []
 
     try:
-        api_key = obter_api_key_segura()
-        arquivos = localizar_imagens_para_processar(caminhos_entrada)
-        originais_str = [arq.name for arq in arquivos]
+        if not imagens:
+            raise ValueError("Nenhuma imagem fornecida para análise.")
+        if len(imagens) > MAX_IMAGENS_POR_INSPECAO:
+            raise ValueError(
+                f"Limite excedido: envie no máximo {MAX_IMAGENS_POR_INSPECAO} imagens por inspeção."
+            )
 
-        parts_imagens: list[types.Part] = []
-        for idx, arq in enumerate(arquivos, start=1):
-            caminho_novo, part = renomear_e_padronizar_imagem(arq, idx, lote_id)
-            renomeados_str.append(str(caminho_novo.relative_to(BASE_DIR)))
-            parts_imagens.append(part)
+        chave = (api_key or os.getenv("GEMINI_API_KEY", "")).strip()
+        if not chave:
+            raise PermissionError("Variável de ambiente GEMINI_API_KEY não configurada.")
+
+        parts: list[types.Part] = []
+        detalhes_resolucao: list[str] = []
+
+        for idx, item in enumerate(imagens, start=1):
+            part, (largura, altura) = _preparar_imagem_em_memoria(item)
+            parts.append(part)
+            resolucoes.append(f"{largura}x{altura}")
+            detalhes_resolucao.append(
+                f"- Imagem {idx}: resolução exata de {largura}x{altura} pixels."
+            )
 
         client = genai.Client(
-            api_key=api_key,
-            http_options=types.HttpOptions(timeout=20000),
+            api_key=chave,
+            http_options=types.HttpOptions(timeout=timeout_ms),
         )
-        modelos = listar_modelos_candidatos(client)
 
         config = types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
-            response_schema=LaudoTecnicoMadeira,
+            response_schema=ResultadoAnaliseIA,
             temperature=0.1,
         )
-        conteudo = [
-            *parts_imagens,
-            "Realize a inspeção física desta peça de madeira e preencha o laudo técnico estruturado.",
-        ]
 
+        prompt_usuario = (
+            "Realize a inspeção física deste dormente de madeira.\n"
+            "Resoluções das imagens enviadas:\n"
+            + "\n".join(detalhes_resolucao)
+            + "\n\nIdentifique os defeitos individuais com confiança (0.0 a 1.0) e estime as dimensões em pixels. "
+            "Se houver régua de 30 cm visível, informe o comprimento dela em pixels."
+        )
+
+        conteudo = [*parts, prompt_usuario]
+        modelos = _obter_modelos(modelo)
         ultimo_erro = None
-        for modelo in modelos:
+
+        for nome_modelo in modelos:
             try:
                 response = client.models.generate_content(
-                    model=modelo,
+                    model=nome_modelo,
                     contents=conteudo,
                     config=config,
                 )
                 if response.parsed:
-                    return RespostaBackend(
+                    resposta = RespostaMotorIA(
                         sucesso=True,
-                        timestamp_iso=datetime.now().isoformat(timespec="seconds"),
-                        arquivos_originais=originais_str,
-                        arquivos_renomeados=renomeados_str,
-                        modelo_utilizado=modelo,
+                        timestamp_iso=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        resolucao_enviada_pixels=resolucoes,
+                        modelo_utilizado=nome_modelo,
                         tempo_processamento_segundos=round(time.time() - inicio, 2),
-                        laudo=response.parsed,
+                        analise=response.parsed,
                         erro=None,
                     )
+                    return resposta.model_dump(by_alias=True) if retornar_dict else resposta
             except (APIError, Exception) as err:
                 ultimo_erro = err
 
-        raise RuntimeError(f"Servidores indisponíveis no momento. Detalhe: {ultimo_erro}")
+        raise RuntimeError(f"Falha ao consultar API Gemini. Último erro: {ultimo_erro}")
 
     except Exception as erro_fatal:
-        return RespostaBackend(
+        resposta_erro = RespostaMotorIA(
             sucesso=False,
-            timestamp_iso=datetime.now().isoformat(timespec="seconds"),
-            arquivos_originais=originais_str,
-            arquivos_renomeados=renomeados_str,
+            timestamp_iso=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            resolucao_enviada_pixels=resolucoes,
             modelo_utilizado=None,
             tempo_processamento_segundos=round(time.time() - inicio, 2),
-            laudo=None,
+            analise=None,
             erro=str(erro_fatal),
         )
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Motor de Inspeção de Madeira com Renomeação Automática e Saída JSON."
-    )
-    parser.add_argument(
-        "imagens",
-        nargs="*",
-        help="Opcional: caminho da(s) foto(s). Se vazio, pega a foto mais recente da pasta.",
-    )
-    args = parser.parse_args()
-
-    resultado = executar_inspecao(args.imagens)
-
-    # Garante saída UTF-8 limpa no terminal do Windows para o backend consumir
-    sys.stdout.reconfigure(encoding="utf-8")
-    print(json.dumps(resultado.model_dump(), indent=2, ensure_ascii=False))
-
-    if not resultado.sucesso:
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
+        return resposta_erro.model_dump(by_alias=True) if retornar_dict else resposta_erro
