@@ -17,11 +17,30 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 load_dotenv(override=False)
 
 MAX_IMAGENS_POR_INSPECAO = 5
-MODELOS_PADRAO = [
+
+# Cache em memória para não consultar client.models.list() em toda requisição do FastAPI
+_CACHE_MODELOS_DISPONIVEIS: Optional[list[str]] = None
+
+MODELOS_PREFERIDOS = [
+    "gemini-3.1-flash",
+    "gemini-3.0-flash",
+    "gemini-3.1-pro-preview",
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
 ]
+
+TERMOS_IGNORADOS = (
+    "tts",
+    "image",
+    "embedding",
+    "veo",
+    "imagen",
+    "audio",
+    "robotics",
+    "gemma",
+    "aqa",
+    "live",
+)
 
 
 # --- 1. Contratos de Dados (camelCase para o contrato do jade-backend) ---
@@ -84,7 +103,7 @@ class CalibracaoEscala(BaseCamelModel):
     )
     comprimento_regua_pixels: Optional[float] = Field(
         None,
-        gt=0,
+        ge=0,
         description="Comprimento ocupado pelos 30 cm da régua em pixels.",
     )
     fator_conversao_px_para_cm: Optional[float] = Field(
@@ -222,13 +241,37 @@ def _preparar_imagem_em_memoria(
     return part, dimensoes
 
 
-def _obter_modelos(modelo_forcado: Optional[str]) -> list[str]:
+def _obter_modelos_cascata(
+    client: genai.Client, modelo_forcado: Optional[str]
+) -> list[str]:
+    """Monta fila de fallback priorizando modelos ativos na conta, com cache em RAM."""
+    global _CACHE_MODELOS_DISPONIVEIS
+
     if modelo_forcado:
         return [modelo_forcado]
+
     env_model = os.getenv("GEMINI_MODEL", "").strip()
     if env_model:
         return [env_model]
-    return MODELOS_PADRAO
+
+    if _CACHE_MODELOS_DISPONIVEIS is None:
+        disponiveis = []
+        try:
+            for m in client.models.list():
+                nome = m.name.replace("models/", "")
+                if nome.startswith("gemini-") and not any(
+                    t in nome for t in TERMOS_IGNORADOS
+                ):
+                    disponiveis.append(nome)
+        except Exception:
+            disponiveis = []
+
+        fila = [m for m in MODELOS_PREFERIDOS if m in disponiveis] + [
+            m for m in disponiveis if m not in MODELOS_PREFERIDOS
+        ]
+        _CACHE_MODELOS_DISPONIVEIS = fila if fila else MODELOS_PREFERIDOS
+
+    return _CACHE_MODELOS_DISPONIVEIS
 
 
 # --- 4. Interface Pública para o Backend ---
@@ -241,13 +284,6 @@ def analisar_madeira(
 ) -> Union[dict, RespostaMotorIA]:
     """
     Executa a análise visual de até 5 imagens de dormentes de madeira.
-
-    Args:
-        imagens: Lista de imagens em bytes (ex: UploadFile.read()) ou caminhos de arquivo.
-        api_key: Chave da API Gemini. Se omitida, lê de GEMINI_API_KEY no ambiente.
-        modelo: Nome fixo do modelo Gemini. Se omitido, usa GEMINI_MODEL ou lista padrão.
-        timeout_ms: Timeout da requisição HTTP para a API Gemini em milissegundos.
-        retornar_dict: Se True, retorna dict já serializado em camelCase. Se False, retorna RespostaMotorIA.
     """
     inicio = time.time()
     resolucoes: list[str] = []
@@ -296,9 +332,9 @@ def analisar_madeira(
         )
 
         conteudo = [*parts, prompt_usuario]
-        modelos = _obter_modelos(modelo)
-        ultimo_erro = None
+        modelos = _obter_modelos_cascata(client, modelo)
 
+        erros_por_modelo = []
         for nome_modelo in modelos:
             try:
                 response = client.models.generate_content(
@@ -309,18 +345,26 @@ def analisar_madeira(
                 if response.parsed:
                     resposta = RespostaMotorIA(
                         sucesso=True,
-                        timestamp_iso=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                        timestamp_iso=datetime.now(timezone.utc).isoformat(
+                            timespec="seconds"
+                        ),
                         resolucao_enviada_pixels=resolucoes,
                         modelo_utilizado=nome_modelo,
                         tempo_processamento_segundos=round(time.time() - inicio, 2),
                         analise=response.parsed,
                         erro=None,
                     )
-                    return resposta.model_dump(by_alias=True) if retornar_dict else resposta
+                    return (
+                        resposta.model_dump(by_alias=True)
+                        if retornar_dict
+                        else resposta
+                    )
             except (APIError, Exception) as err:
-                ultimo_erro = err
+                erros_por_modelo.append(f"{nome_modelo}: {err}")
 
-        raise RuntimeError(f"Falha ao consultar API Gemini. Último erro: {ultimo_erro}")
+        raise RuntimeError(
+            f"Todos os modelos falharam. Detalhes: {' | '.join(erros_por_modelo[:3])}"
+        )
 
     except Exception as erro_fatal:
         resposta_erro = RespostaMotorIA(
@@ -332,4 +376,8 @@ def analisar_madeira(
             analise=None,
             erro=str(erro_fatal),
         )
-        return resposta_erro.model_dump(by_alias=True) if retornar_dict else resposta_erro
+        return (
+            resposta_erro.model_dump(by_alias=True)
+            if retornar_dict
+            else resposta_erro
+        )
